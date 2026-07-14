@@ -1,0 +1,22 @@
+{
+  "domain": "tibber",
+  "name": "Tibber",
+  "codeowners": [
+    "@danielhiversen"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "application_credentials",
+    "recorder"
+  ],
+  "documentation": "https://www.home-assistant.io/integrations/tibber",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "loggers": [
+    "tibber"
+  ],
+  "requirements": [
+    "https://github.com/honzup/pyTibber/archive/0e37d3ba9f458740f63ac3cb9c4353663d8be598.tar.gz#pyTibber==0.37.6.post1"
+  ],
+  "version": "2026.6.4.1"
+}

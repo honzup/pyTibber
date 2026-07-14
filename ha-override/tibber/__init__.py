@@ -1,0 +1,227 @@
+"""Support for Tibber."""
+
+import asyncio
+from dataclasses import dataclass, field
+import logging
+
+import aiohttp
+from aiohttp.client_exceptions import ClientError, ClientResponseError
+import tibber
+
+from homeassistant.const import CONF_ACCESS_TOKEN, EVENT_HOMEASSISTANT_STOP, Platform
+from homeassistant.core import Event, HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.entity_component import DATA_INSTANCES
+from homeassistant.helpers.config_entry_oauth2_flow import (
+    ImplementationUnavailableError,
+    OAuth2Session,
+    async_get_config_entry_implementation,
+)
+from homeassistant.helpers.typing import ConfigType
+from homeassistant.util import dt as dt_util, ssl as ssl_util
+
+from .const import AUTH_IMPLEMENTATION, DATA_HASS_CONFIG, DOMAIN, TibberConfigEntry
+from .coordinator import (
+    TibberDataAPICoordinator,
+    TibberDataCoordinator,
+    TibberFetchPriceCoordinator,
+    TibberPriceCoordinator,
+)
+from .services import async_setup_services
+
+PLATFORMS = [Platform.BINARY_SENSOR, Platform.NOTIFY, Platform.SENSOR]
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class TibberRuntimeData:
+    """Runtime data for Tibber API entries."""
+
+    session: OAuth2Session
+    data_api_coordinator: TibberDataAPICoordinator | None = field(default=None)
+    data_coordinator: TibberDataCoordinator | None = field(default=None)
+    fetch_price_coordinator: TibberFetchPriceCoordinator | None = field(default=None)
+    price_coordinator: TibberPriceCoordinator | None = field(default=None)
+    _client: tibber.Tibber | None = None
+
+    async def _async_get_access_token(self) -> str:
+        """Return a valid Tibber access token."""
+        await self.session.async_ensure_token_valid()
+        token = self.session.token
+        access_token: str | None = token.get(CONF_ACCESS_TOKEN)
+        if not access_token:
+            raise ConfigEntryAuthFailed("Access token missing from OAuth session")
+        return access_token
+
+    async def async_get_client(self, hass: HomeAssistant) -> tibber.Tibber:
+        """Return an authenticated Tibber client."""
+        access_token = await self._async_get_access_token()
+        if self._client is None:
+            self._client = tibber.Tibber(
+                access_token=access_token,
+                websession=async_get_clientsession(hass),
+                time_zone=dt_util.get_default_time_zone(),
+                ssl=ssl_util.get_default_context(),
+                refresh_access_token=self._async_get_access_token,
+            )
+        else:
+            await self._client.set_access_token(access_token)
+        return self._client
+
+
+def _platform_registered(
+    hass: HomeAssistant, platform: Platform, entry_id: str
+) -> bool:
+    """Return True if the domain's EntityComponent has this entry registered.
+
+    Forwarded platform setup failures are silently discarded by config_entries,
+    which can leave a platform (typically notify) untracked while the entry is
+    LOADED; unloading such a phantom platform raises "Config entry was never
+    loaded!" and wedges the entry into FAILED_UNLOAD (core #166228).
+    """
+    component = hass.data.get(DATA_INSTANCES, {}).get(str(platform))
+    if component is None:
+        return False
+    try:
+        return entry_id in component._platforms  # noqa: SLF001
+    except AttributeError:  # core refactored the attribute - use normal unload
+        return True
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the Tibber component."""
+
+    hass.data[DATA_HASS_CONFIG] = config
+
+    async_setup_services(hass)
+
+    return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: TibberConfigEntry) -> bool:
+    """Set up a config entry."""
+
+    # Added in 2026.1 to migrate existing users to OAuth2 (Tibber Data API).
+    # Can be removed after 2026.7
+    if AUTH_IMPLEMENTATION not in entry.data:
+        raise ConfigEntryAuthFailed(
+            translation_domain=DOMAIN,
+            translation_key="data_api_reauth_required",
+        )
+
+    try:
+        implementation = await async_get_config_entry_implementation(hass, entry)
+    except ImplementationUnavailableError as err:
+        raise ConfigEntryNotReady(
+            translation_domain=DOMAIN,
+            translation_key="oauth2_implementation_unavailable",
+        ) from err
+
+    session = OAuth2Session(hass, entry, implementation)
+    try:
+        await session.async_ensure_token_valid()
+    except ClientResponseError as err:
+        if 400 <= err.status < 500:
+            raise ConfigEntryAuthFailed(
+                "OAuth session is not valid, reauthentication required"
+            ) from err
+        raise ConfigEntryNotReady from err
+    except ClientError as err:
+        raise ConfigEntryNotReady from err
+
+    entry.runtime_data = TibberRuntimeData(
+        session=session,
+    )
+
+    tibber_connection = await entry.runtime_data.async_get_client(hass)
+
+    async def _close(event: Event) -> None:
+        try:
+            async with asyncio.timeout(10):
+                await tibber_connection.rt_disconnect()
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning("Timeout or error disconnecting Tibber realtime on stop")
+
+    entry.async_on_unload(hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _close))
+
+    try:
+        await tibber_connection.update_info()
+    except (
+        TimeoutError,
+        aiohttp.ClientError,
+        tibber.RetryableHttpExceptionError,
+    ) as err:
+        raise ConfigEntryNotReady("Unable to connect") from err
+    except tibber.InvalidLoginError as err:
+        raise ConfigEntryAuthFailed("Invalid login credentials") from err
+    except tibber.FatalHttpExceptionError as err:
+        raise ConfigEntryNotReady("Fatal HTTP error from Tibber API") from err
+
+    if tibber_connection.get_homes(only_active=True):
+        fetch_price_coordinator = TibberFetchPriceCoordinator(hass, entry)
+        await fetch_price_coordinator.async_config_entry_first_refresh()
+        entry.runtime_data.fetch_price_coordinator = fetch_price_coordinator
+
+        price_coordinator = TibberPriceCoordinator(hass, entry, fetch_price_coordinator)
+        await price_coordinator.async_config_entry_first_refresh()
+        entry.runtime_data.price_coordinator = price_coordinator
+
+        data_coordinator = TibberDataCoordinator(hass, entry, tibber_connection)
+        await data_coordinator.async_config_entry_first_refresh()
+        entry.runtime_data.data_coordinator = data_coordinator
+
+    coordinator = TibberDataAPICoordinator(hass, entry)
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data.data_api_coordinator = coordinator
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    for platform in PLATFORMS:
+        if not _platform_registered(hass, platform, entry.entry_id):
+            _LOGGER.error(
+                "Platform %s did not register during Tibber setup - a later "
+                "unload of it would wedge the entry (core #166228)",
+                platform,
+            )
+    return True
+
+
+async def async_unload_entry(
+    hass: HomeAssistant, config_entry: TibberConfigEntry
+) -> bool:
+    """Unload a config entry."""
+    # Only unload platforms the EntityComponents actually track for this entry.
+    # A platform lost to a silently-failed forward setup has nothing to unload;
+    # asking anyway raises inside config_entries and wedges into FAILED_UNLOAD.
+    to_unload = [
+        p for p in PLATFORMS if _platform_registered(hass, p, config_entry.entry_id)
+    ]
+    if skipped := set(PLATFORMS) - set(to_unload):
+        _LOGGER.warning(
+            "Platforms %s were not registered for the Tibber entry (lost during "
+            "an earlier reload); treating as already unloaded",
+            skipped,
+        )
+    unload_ok = (
+        await hass.config_entries.async_unload_platforms(config_entry, to_unload)
+        if to_unload
+        else True
+    )
+    if unload_ok:
+        # Disconnect the cached client directly. Fetching the client here would
+        # refresh the OAuth token over the network and can trigger a full
+        # websocket reset mid-teardown; combined with the unbounded close path
+        # that deadlocks the entry into FAILED_UNLOAD (home-assistant/core#176268).
+        if (client := config_entry.runtime_data._client) is not None:  # noqa: SLF001
+            try:
+                async with asyncio.timeout(10):
+                    await client.rt_disconnect()
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Timeout or error disconnecting Tibber realtime during unload"
+                )
+    return unload_ok
