@@ -1,7 +1,7 @@
 # Home Assistant tibber custom-component override
 
 Copy of `homeassistant/components/tibber` from core 2026.6.4 with local fixes,
-deployed to `/config/custom_components/tibber` on HA (192.168.1.60). It shadows
+deployed to `/config/custom_components/tibber` on the home HA instance. It shadows
 the core integration until deleted.
 
 Changes vs core 2026.6.4 (`__init__.py`, `manifest.json`):
